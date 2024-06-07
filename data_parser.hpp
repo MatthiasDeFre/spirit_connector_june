@@ -46,6 +46,10 @@ public:
 	uint32_t get_current_tile_size(uint32_t tile_number) {
 		return current_tiles[tile_number].get_tile_length();
 	}
+	uint32_t get_current_tile_nr(uint32_t tile_number) {
+		return current_tiles[tile_number].get_frame_number();
+	}
+
 	uint32_t get_current_audio_size() {
 		return current_audio.get_frame_length();
 	}

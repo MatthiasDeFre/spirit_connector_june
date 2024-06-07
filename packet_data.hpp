@@ -26,9 +26,12 @@ struct PacketType {
 	}
 
 	enum Type {
+		ReadyPacket = 0,
 		TilePacket = 1,
 		AudioPacket = 2,
-		ControlPacket = 3
+		ControlPacket = 3,
+		TrackStatusPacket = 4,
+		NumTilePacket = 5
 	};
 };
 
@@ -126,4 +129,8 @@ struct AudioPacketHeader {
 	}
 protected:
 	AudioPacketHeader() {};
+};
+
+struct TrackStatusChangedHeader {
+
 };

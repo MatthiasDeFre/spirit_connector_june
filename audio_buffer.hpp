@@ -34,6 +34,9 @@ public:
 			guard.unlock();
 			return false;
 		}
+		while (audio_queue.size() > 100) {
+			audio_queue.pop();
+		}
 		audio_queue.push(std::move(audio_frame));
 		// frame_numbers[tile_number] = frame_number;
 		guard.unlock();

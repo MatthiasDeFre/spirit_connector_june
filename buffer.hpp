@@ -37,6 +37,9 @@ public:
 			guard.unlock();
 			return false;
 		}
+		while (!tile_queues[tile_number].empty()) {
+			tile_queues[tile_number].pop();
+		}
 		tile_queues[tile_number].push(std::move(tile));
 		// frame_numbers[tile_number] = frame_number;
 		guard.unlock();

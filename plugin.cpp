@@ -24,6 +24,7 @@ using namespace std;
 bool one_socket = true;
 #ifdef WIN32
 static WSADATA wsa;
+//#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
 #endif
 static struct sockaddr_in si_send;
 static SOCKET s_send;
@@ -38,11 +39,15 @@ uint32_t n_tiles;
 static thread worker;
 static bool keep_working = true;
 static bool initialized = false;
+static bool peer_ready = false;
 
 mutex m_receivers;
 mutex m_recv_data;
 mutex m_send_data;
 mutex m_recv_control;
+mutex m_peer_ready;
+
+condition_variable cv_peer_ready;
 
 static char* buf = NULL;
 static char* buf_ori = NULL;
@@ -188,10 +193,10 @@ int initialize(char* ip_send, uint32_t port_send, char* ip_recv, uint32_t port_r
 	buf = (char*)malloc(BUFLEN);
 	buf_ori = buf;
 	keep_working = true;
-	
+	unique_lock<mutex> guard(m_receivers);
 	client_receivers = map<uint32_t, ClientReceiver*>();
 	client_receivers.clear();
-
+	guard.unlock();
 #ifdef WIN32
 	custom_log("initialize: Setting up socket to " + string(ip_send), Verbose, Color::Orange);
 	if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
@@ -238,13 +243,15 @@ int initialize(char* ip_send, uint32_t port_send, char* ip_recv, uint32_t port_r
 	getsockname(s_send, (sockaddr*)&our_addr, &our_addr_len);
 	custom_log("initialize: getsockname: Our port is " + to_string(ntohs(our_addr.sin_port)) + ", their port is " +
 		to_string(ntohs(si_send.sin_port)), Verbose, Color::Orange);
-
+	//BOOL bNewBehavior = FALSE;
+	//DWORD dwBytesReturned = 0;
+	//WSAIoctl(s_send, SIO_UDP_CONNRESET, &bNewBehavior, sizeof bNewBehavior, NULL, 0, &dwBytesReturned, NULL, NULL);
 	// Send a message to the Golang peer, containing the number of tiles (<10 for now)
-	if (sendto(s_send, t, BUFLEN, 0, (struct sockaddr*)&si_send, slen_send) == SOCKET_ERROR) {
+	/*if (sendto(s_send, t, BUFLEN, 0, (struct sockaddr*)&si_send, slen_send) == SOCKET_ERROR) {
 		custom_log("initialize: sendto: ERROR: " + std::to_string(WSAGetLastError()), Default, Color::Red);
 		WSACleanup();
 		return SendToError;
-	}
+	}*/
 
 	// In case a separate port is used to receive incoming data
 	if (string(ip_send) != string(ip_recv) || port_send != port_recv) {
@@ -280,8 +287,11 @@ int initialize(char* ip_send, uint32_t port_send, char* ip_recv, uint32_t port_r
 		getsockname(s_send, (sockaddr*)&our_addr, &our_addr_len);
 		custom_log("initialize: getsockname: Our port is " + to_string(our_addr.sin_port) + ", their port is " +
 			to_string(si_recv.sin_port), Verbose, Color::Orange);
-
+		//BOOL bNewBehavior = FALSE;
+		//DWORD dwBytesReturned = 0;
+		//WSAIoctl(s_recv, SIO_UDP_CONNRESET, &bNewBehavior, sizeof bNewBehavior, NULL, 0, &dwBytesReturned, NULL, NULL);
 		// Send a message to the Golang peer, containing the number of tiles (<10 for now)
+		// TODO rework this 
 		if (sendto(s_recv, t, BUFLEN, 0, (struct sockaddr*)&si_recv, slen_recv) == SOCKET_ERROR) {
 			custom_log("initialize: sendto: ERROR: " + std::to_string(WSAGetLastError()), Default, Color::Red);
 			WSACleanup();
@@ -319,7 +329,7 @@ void listen_for_data() {
 			if ((size = recvfrom(s_send, buf, BUFLEN, 0, NULL, NULL)) == SOCKET_ERROR) {
 				custom_log("listen_for_data: recvfrom: ERROR: " + std::to_string(WSAGetLastError()), Default,
 					Color::Red);
-				std::this_thread::sleep_for(std::chrono::milliseconds(100));
+				//std::this_thread::sleep_for(std::chrono::milliseconds(100));
 				continue;
 			}
 		}
@@ -339,92 +349,115 @@ void listen_for_data() {
 
 		/*
 			Distinguish between different packet types:
+			    0: peer is ready to receive / send data
 				1: point cloud frame
 				2: audio frame
 				3: control message
 		*/
-		if (p_type.type == PacketType::TilePacket) {
+		switch (p_type.type) {
+			case (PacketType::ReadyPacket): {
+				// Peer is now ready to receive data
+				unique_lock<mutex> lk(m_peer_ready);
+				peer_ready = true;
+				char t[BUFLEN] = { 0 };
+				t[0] = (char)n_tiles;
+				custom_log("listen_for_data: connected to peer", Default, Color::Orange);
+				if (sendto(s_send, t, BUFLEN, 0, (struct sockaddr*)&si_send, slen_send) == SOCKET_ERROR) {
+					custom_log("initialize: sendto: ERROR: " + std::to_string(WSAGetLastError()), Default, Color::Red);
+					WSACleanup();
+					return;
+				}
+				lk.unlock();
+				cv_peer_ready.notify_all();
+				break;
+			};
+			case (PacketType::TilePacket): {
+				// Extract the packet header
+				struct PacketHeader p_header(&buf, size);
 
-			// Extract the packet header
-			struct PacketHeader p_header(&buf, size);
+				// Get the receiver belonging to the connected peer
+				ClientReceiver* c = find_or_add_receiver(p_header.client_id);
 
-			// Get the receiver belonging to the connected peer
-			ClientReceiver* c = find_or_add_receiver(p_header.client_id);
+				// Retrieve tile iterator, creating a new instance if needed
+				auto tile = c->recv_tiles.find(make_pair(p_header.frame_number, p_header.tile_id));
+				if (tile == c->recv_tiles.end()) {
+					auto e = c->recv_tiles.emplace(make_pair(p_header.frame_number, p_header.tile_id),
+						ReceivedTile(p_header.file_length, p_header.frame_number, p_header.tile_id));
+					tile = e.first;
+					custom_log("listen_for_data: New tile: " + p_header.string_representation(), Debug, Color::Yellow);
+				}
 
-			// Retrieve tile iterator, creating a new instance if needed
-			auto tile = c->recv_tiles.find(make_pair(p_header.frame_number, p_header.tile_id));
-			if (tile == c->recv_tiles.end()) {
-				auto e = c->recv_tiles.emplace(make_pair(p_header.frame_number, p_header.tile_id),
-					ReceivedTile(p_header.file_length, p_header.frame_number, p_header.tile_id));
-				tile = e.first;
-				custom_log("listen_for_data: New tile: " + p_header.string_representation(), Debug, Color::Yellow);
-			}
+				// Insert the new data
+				bool inserted = tile->second.insert(buf, p_header.file_offset, p_header.packet_length, size);
+				if (!inserted) {
+					custom_log("listen_for_data: Failed to insert: " + p_header.string_representation(), Default,
+						Color::Red);
+				}
 
-			// Insert the new data
-			bool inserted = tile->second.insert(buf, p_header.file_offset, p_header.packet_length, size);
-			if (!inserted) {
-				custom_log("listen_for_data: Failed to insert: " + p_header.string_representation(), Default,
-					Color::Red);
-			}
+				// Check if all data corresponding to the frame has arrived
+				if (tile->second.is_complete()) {
+					custom_log("listen_for_data: Completed: " + p_header.string_representation(), Debug, Color::Yellow);
+					c->tile_buffer.insert_tile(tile->second, p_header.tile_id);
+					c->recv_tiles.erase(make_pair(p_header.frame_number, p_header.tile_id));
+					custom_log("listen_for_data: New buffer size: " +
+						to_string(c->tile_buffer.get_buffer_size(p_header.tile_id)), Debug, Color::Yellow);
+				}
+				break;
+			};
+			case (PacketType::AudioPacket): {
+				// Extract the packet header
+				struct AudioPacketHeader p_header(&buf, size);
 
-			// Check if all data corresponding to the frame has arrived
-			if (tile->second.is_complete()) {
-				custom_log("listen_for_data: Completed: " + p_header.string_representation(), Debug, Color::Yellow);
-				c->tile_buffer.insert_tile(tile->second, p_header.tile_id);
-				c->recv_tiles.erase(make_pair(p_header.frame_number, p_header.tile_id));
-				custom_log("listen_for_data: New buffer size: " +
-					to_string(c->tile_buffer.get_buffer_size(p_header.tile_id)), Debug, Color::Yellow);
-			}
-		}
-		else if (p_type.type == PacketType::AudioPacket) {
-			// Extract the packet header
-			struct AudioPacketHeader p_header(&buf, size);
-			
-			
-			//custom_log("listen_for_data: New audio: " + std::to_string(AudioPacketHeader::size()) + " " + std::to_string(size), Default);
-			
-			// Get the receiver belonging to the connected peer
-			ClientReceiver* c = find_or_add_receiver(p_header.client_id);
 
-		// Retrieve tile iterator, creating a new instance if needed
-			auto audio_frame = c->recv_audio.find(p_header.frame_number);
-			if (audio_frame == c->recv_audio.end()) {
-				auto e = c->recv_audio.emplace(p_header.frame_number,
-					ReceivedAudio(p_header.file_length, p_header.frame_number));
-				audio_frame = e.first;
-				if(p_header.frame_number % 100 == 0)
-				custom_log("listen_for_data: New audio: " + std::to_string(p_header.file_offset) + " " + std::to_string(p_header.packet_length) + std::to_string(p_header.file_length), Debug);
-			}
-			
-			
-			// Insert the new data
-			bool inserted = audio_frame->second.insert(buf, p_header.file_offset, p_header.packet_length, size);
-			if (!inserted) {
-				//custom_log("listen_for_data: Failed to insert: " + p_header.string_representation(), Default,
-				//	Color::Red);
-			}
-			// Check if all data corresponding to the frame has arrived
-			if (audio_frame->second.is_complete()) {
-				//custom_log("listen_for_data: Completed: " + p_header.string_representation(), Verbose, Color::Yellow);
-				c->audio_buffer.insert_audio_frame(audio_frame->second);
-				c->recv_audio.erase(p_header.frame_number);
-			//	custom_log("listen_for_data: New buffer size: " +
-			//		to_string(c->audio_buffer.get_buffer_size()), Verbose, Color::Yellow);
-			//	custom_log("listen_for_data: done", Default);
-			}
-		}
-		else if (p_type.type == PacketType::ControlPacket) {
+				//custom_log("listen_for_data: New audio: " + std::to_string(AudioPacketHeader::size()) + " " + std::to_string(size), Default);
 
-			// Push the message
-			recv_controls.push(ReceivedControl(buf, (uint32_t)size));
+				// Get the receiver belonging to the connected peer
+				ClientReceiver* c = find_or_add_receiver(p_header.client_id);
 
-		}
-		else {
-			custom_log("listen_for_data: ERROR: unknown packet type " + to_string(p_type.type), Default, Color::Red);
-			guard.unlock();
-			exit(EXIT_FAILURE);
-		}
+				// Retrieve tile iterator, creating a new instance if needed
+				auto audio_frame = c->recv_audio.find(p_header.frame_number);
+				if (audio_frame == c->recv_audio.end()) {
+					auto e = c->recv_audio.emplace(p_header.frame_number,
+						ReceivedAudio(p_header.file_length, p_header.frame_number));
+					audio_frame = e.first;
+					if (p_header.frame_number % 100 == 0)
+						custom_log("listen_for_data: New audio: " + std::to_string(p_header.file_offset) + " " + std::to_string(p_header.packet_length) + std::to_string(p_header.file_length), Debug);
+				}
 
+
+				// Insert the new data
+				bool inserted = audio_frame->second.insert(buf, p_header.file_offset, p_header.packet_length, size);
+				if (!inserted) {
+					//custom_log("listen_for_data: Failed to insert: " + p_header.string_representation(), Default,
+					//	Color::Red);
+				}
+				// Check if all data corresponding to the frame has arrived
+				if (audio_frame->second.is_complete()) {
+					//custom_log("listen_for_data: Completed: " + p_header.string_representation(), Verbose, Color::Yellow);
+					c->audio_buffer.insert_audio_frame(audio_frame->second);
+					c->recv_audio.erase(p_header.frame_number);
+					//	custom_log("listen_for_data: New buffer size: " +
+					//		to_string(c->audio_buffer.get_buffer_size()), Verbose, Color::Yellow);
+					//	custom_log("listen_for_data: done", Default);
+				}
+				break;
+			};
+			case (PacketType::ControlPacket): {
+				// Push the message
+				recv_controls.push(ReceivedControl(buf, (uint32_t)size));
+				break;
+			};
+			case (PacketType::TrackStatusPacket): {
+				// Push the message
+				recv_controls.push(ReceivedControl(buf, (uint32_t)size));
+				break;
+			};
+			default:
+				custom_log("listen_for_data: ERROR: unknown packet type " + to_string(p_type.type), Default, Color::Red);
+				guard.unlock();
+				exit(EXIT_FAILURE);
+				break;
+		};
 		// Reset the buffer pointer
 		buf = buf_ori;
 
@@ -443,6 +476,8 @@ void listen_for_data() {
 void clean_up() {
 	custom_log("clean_up: Attempting to clean up", Verbose, Color::Orange);
 
+	// If we close before peer is started we still want to wake up all the sleeping threads
+	cv_peer_ready.notify_all();
 	// Check if the DLL has already been initialized
 	if (initialized) {
 
@@ -592,6 +627,7 @@ int get_tile_size(uint32_t client_id, uint32_t tile_id) {
 	// Wait until a new frame is available
 	while (c->tile_buffer.get_buffer_size(tile_id) == 0) {
 		this_thread::sleep_for(chrono::milliseconds(1));
+		
 		if (!keep_working) {
 			return 0;
 		}
@@ -635,6 +671,21 @@ void retrieve_tile(void* d, uint32_t size, uint32_t client_id, uint32_t tile_id)
 			" successfully retrieved", Debug, Color::Yellow);
 	}
 }
+
+/*
+	This function allows to retrieve the next frame corresponding to a tile in memory. The function should be called
+	from within the Unity reader once get_tile_size has returned the tile size and the required memory has been
+	allocated.
+*/
+int get_tile_frame_number(uint32_t client_id, uint32_t tile_id) {
+	custom_log("get_tile_frame_number: " + to_string(client_id) + ", " + to_string(tile_id), Debug, Color::Yellow);
+
+	// Get the receiver belonging to the connected peer
+	ClientReceiver* c = find_or_add_receiver(client_id);
+
+	return c->data_parser.get_current_tile_nr(tile_id);
+}
+
 
 /*
 	This function allows to send out an audio frame to the Golang peer. It returns the amount of bytes sent.
@@ -808,4 +859,9 @@ void retrieve_control(void* d, uint32_t size) {
 	char* p = next_control_packet.get_data();
 	char* temp_d = reinterpret_cast<char*>(d);
 	memcpy(temp_d, p, size);
+}
+
+void wait_for_peer() {
+	unique_lock<mutex> lk(m_peer_ready);
+	cv_peer_ready.wait(lk, [] { return peer_ready; });
 }
