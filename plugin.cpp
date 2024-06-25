@@ -65,6 +65,16 @@ mutex m_logging;
 
 string api_version = "1.0";
 
+extern "C"
+{
+	typedef void(*TrackChangeCallBack)(uint32_t client_id, uint32_t frame_nr, uint32_t tile_nr, bool is_added);
+	static TrackChangeCallBack trackChangeCallbackInstance = nullptr;
+	DLLExport void register_track_change_callback(TrackChangeCallBack cb);
+}
+void register_track_change_callback(TrackChangeCallBack cb) {
+	trackChangeCallbackInstance = cb;
+}
+
 enum CONNECTION_SETUP_CODE : int {
 	ConnectionSuccess = 0,
 	StartUpError = 1,
@@ -110,11 +120,12 @@ void custom_log(string message, int _log_level = 0, Color color = Color::Black) 
 	if (_log_level <= log_level) {
 		Log::log(message, color);
 	}
-	if (log_file != "") {
-		ofstream ofs(log_file.c_str(), ios_base::out | ios_base::app);
-		ofs << get_current_date_time(false) << '\t' << message << '\n';
-		ofs.close();
-	}
+	//if (log_file != "") {
+	//	Log::log("test", color);
+	//	ofstream ofs(log_file.c_str(), ios_base::out | ios_base::app);
+	//	ofs << get_current_date_time(false) << '\t' << message << '\n';
+	//	ofs.close();
+	//}
 	guard.unlock();
 }
 
@@ -342,7 +353,7 @@ void listen_for_data() {
 				continue;
 			}
 		}
-		custom_log("listen_for_data: recvfrom: got " + std::to_string(size) + " bytes", Debug);
+		//custom_log("listen_for_data: recvfrom: got " + std::to_string(size) + " bytes", Debug);
 
 		// Extract the packet type
 		struct PacketType p_type(&buf, size);
@@ -390,17 +401,19 @@ void listen_for_data() {
 				// Insert the new data
 				bool inserted = tile->second.insert(buf, p_header.file_offset, p_header.packet_length, size);
 				if (!inserted) {
-					custom_log("listen_for_data: Failed to insert: " + p_header.string_representation(), Default,
-						Color::Red);
+					//custom_log("listen_for_data: Failed to insert: " + p_header.string_representation(), Default,
+					//	Color::Red);
 				}
 
 				// Check if all data corresponding to the frame has arrived
 				if (tile->second.is_complete()) {
-					custom_log("listen_for_data: Completed: " + p_header.string_representation(), Debug, Color::Yellow);
+					if (tile->second.get_frame_number() % 10 == 0) {
+						custom_log("listen_for_data: Completed: " + to_string(p_header.frame_number) + " " + to_string(p_header.tile_id), Default, Color::Yellow);
+					}
 					c->tile_buffer.insert_tile(tile->second, p_header.tile_id);
 					c->recv_tiles.erase(make_pair(p_header.frame_number, p_header.tile_id));
-					custom_log("listen_for_data: New buffer size: " +
-						to_string(c->tile_buffer.get_buffer_size(p_header.tile_id)), Debug, Color::Yellow);
+					//custom_log("listen_for_data: New buffer size: " +
+					//	to_string(c->tile_buffer.get_buffer_size(p_header.tile_id)), Debug, Color::Yellow);
 				}
 				break;
 			};
@@ -448,8 +461,12 @@ void listen_for_data() {
 				break;
 			};
 			case (PacketType::TrackStatusPacket): {
-				// Push the message
-				recv_controls.push(ReceivedControl(buf, (uint32_t)size));
+				// Extract the packet header
+				if (trackChangeCallbackInstance != nullptr) {
+					struct TrackStatusChangedHeader p_header(&buf, size);
+					trackChangeCallbackInstance(p_header.client_id, p_header.last_frame_nr, p_header.tile_nr, p_header.is_added);
+				}
+				
 				break;
 			};
 			default:
@@ -860,6 +877,56 @@ void retrieve_control(void* d, uint32_t size) {
 	char* temp_d = reinterpret_cast<char*>(d);
 	memcpy(temp_d, p, size);
 }
+
+/*
+	This function allows to send out an audio frame to the Golang peer. It returns the amount of bytes sent.
+*/
+int send_control_packet(void* data, uint32_t size) {
+	custom_log("send_control_packet: Size " + to_string(size), Debug, Color::Green);
+
+	if (!initialized) {
+		custom_log("send_tile: ERROR: The DLL has not yet been initialized!", Default, Color::Red);
+		return -1;
+	}
+
+	// Required parameters
+	int full_size_sent = 0;
+	char* temp_d = reinterpret_cast<char*>(data);
+
+	// Make sure only one process is sending out packets
+	unique_lock<mutex> guard(m_send_data);
+
+	// Send out packets as long as needed
+	// Determine the amount of bytes to send out
+
+	// Insert all data into a buffer
+	char buf_msg[BUFLEN];
+	memcpy(buf_msg, reinterpret_cast<char*>(data), size);
+
+	// Send out the packet
+	int size_sent = send_packet(buf_msg, size, PacketType::ControlPacket);
+	if (size_sent < 0) {
+		guard.unlock();
+		custom_log("send_control_packet: ERROR: the return value of send_packet should not be negative!", Default,
+			Color::Red);
+		return -1;
+	}
+
+	// Update parameters
+	full_size_sent += size_sent;
+		
+	
+
+	custom_log("send_control_packet: Sent out control frame  " + to_string(full_size_sent) + " bytes", Debug, Color::Green);
+	// Release the mutex
+	guard.unlock();
+
+	// Return the amount of bytes sent
+	return full_size_sent;
+}
+
+
+
 
 void wait_for_peer() {
 	unique_lock<mutex> lk(m_peer_ready);

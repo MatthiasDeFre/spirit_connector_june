@@ -69,7 +69,7 @@ struct PacketHeader {
 	}
 
 	std::string string_representation() {
-		return "¨[VIDEO] Client ID: " +
+		return "[VIDEO] Client ID: " +
 			std::to_string(client_id) +
 			", frame number: " +
 			std::to_string(frame_number) +
@@ -132,5 +132,23 @@ protected:
 };
 
 struct TrackStatusChangedHeader {
+	uint32_t client_id;
+	uint32_t last_frame_nr;
+	uint32_t tile_nr;
+	bool is_video;
+	bool is_added;
 
+	static constexpr auto size() {
+		return sizeof(struct TrackStatusChangedHeader);
+	}
+
+	TrackStatusChangedHeader(char** buf, size_t& avail) {
+		std::memcpy(data(), *buf, size());
+		*buf += size();
+		avail -= size();
+	}
+
+	char* data() {
+		return reinterpret_cast<char*>(this);
+	}
 };
